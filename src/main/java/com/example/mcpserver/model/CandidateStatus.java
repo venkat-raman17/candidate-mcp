@@ -1,10 +1,8 @@
 package com.example.mcpserver.model;
 
 public enum CandidateStatus {
-    APPLIED,
-    SCREENING,
-    INTERVIEW,
-    OFFER,
+    ACTIVE,
+    INACTIVE,
     HIRED,
-    REJECTED
+    BLACKLISTED
 }
