@@ -7,12 +7,16 @@ spring:
       server:
         name: candidate-mcp
         version: 1.0.0
-        instructions: "Candidate MCP endpoint: /mcp"
+        instructions: >
+          Candidate hiring-pipeline MCP server.
+          Tools: getCandidateById, listCandidates, searchCandidates,
+          getCandidatesByStatus, addCandidate, updateCandidateStatus.
+          Resources: candidates://all, candidates://skills.
+          Prompts: candidate-evaluation, hiring-pipeline-summary.
         type: SYNC
         protocol: STATELESS
-        streamable-http:
+        stateless:
           mcp-endpoint: /mcp
-        # capabilities are enabled by default; you can explicitly set them:
         capabilities:
           tool: true
           resource: true
@@ -21,4 +25,5 @@ spring:
 management:
   endpoints:
     web:
+      exposure:
         include: health,info

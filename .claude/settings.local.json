@@ -6,7 +6,14 @@
       "WebFetch(domain:github.com)",
       "WebSearch",
       "WebFetch(domain:spring.io)",
-      "WebFetch(domain:www.baeldung.com)"
+      "WebFetch(domain:www.baeldung.com)",
+      "Bash(jar tf:*)",
+      "Bash(javap:*)",
+      "Bash(xargs -I{} sh -c 'jar tf {} 2>/dev/null | grep \"\"McpSchema.class\"\" | while read f; do echo \"\"{}: $f\"\"; done')",
+      "Bash(./mvnw compile:*)",
+      "Bash(./mvnw test:*)",
+      "Bash(curl:*)",
+      "Bash(pkill:*)"
     ]
   }
 }
