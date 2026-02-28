@@ -1,0 +1,24 @@
+server:
+  port: 8081
+
+spring:
+  ai:
+    mcp:
+      server:
+        name: candidate-mcp
+        version: 1.0.0
+        instructions: "Candidate MCP endpoint: /mcp"
+        type: SYNC
+        protocol: STATELESS
+        streamable-http:
+          mcp-endpoint: /mcp
+        # capabilities are enabled by default; you can explicitly set them:
+        capabilities:
+          tool: true
+          resource: true
+          prompt: true
+
+management:
+  endpoints:
+    web:
+        include: health,info
