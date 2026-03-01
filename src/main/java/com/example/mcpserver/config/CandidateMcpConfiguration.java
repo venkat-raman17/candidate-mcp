@@ -1,7 +1,19 @@
 package com.example.mcpserver.config;
 
+import com.example.mcpserver.client.CxApplicationsClient;
+import com.example.mcpserver.client.JobSyncClient;
+import com.example.mcpserver.client.TalentProfileClient;
+import com.example.mcpserver.dto.agentcontext.ApplicationAgentContext;
+import com.example.mcpserver.dto.agentcontext.JobAgentContext;
+import com.example.mcpserver.dto.agentcontext.ProfileAgentContext;
+import com.example.mcpserver.dto.cxapplications.ApplicationGroup;
+import com.example.mcpserver.dto.cxapplications.AtsApplication;
+import com.example.mcpserver.dto.jobsync.JobRequisitionDocument;
+import com.example.mcpserver.dto.talentprofile.CandidateProfileV2;
 import com.example.mcpserver.model.*;
-import com.example.mcpserver.service.*;
+import com.example.mcpserver.transformer.ApplicationTransformer;
+import com.example.mcpserver.transformer.JobTransformer;
+import com.example.mcpserver.transformer.ProfileTransformer;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
@@ -125,15 +137,18 @@ public class CandidateMcpConfiguration {
 
     @Bean
     public List<McpStatelessServerFeatures.SyncToolSpecification> allTools(
-            CandidateService candidates,
-            ApplicationService applications,
-            AssessmentService assessments,
-            JobService jobs) {
+            JobSyncClient jobSyncClient,
+            CxApplicationsClient cxApplicationsClient,
+            TalentProfileClient talentProfileClient,
+            JobTransformer jobTransformer,
+            ApplicationTransformer applicationTransformer,
+            ProfileTransformer profileTransformer) {
         return Stream.of(
-                candidateProfileTools(candidates, jobs),
-                applicationIntelligenceTools(applications, candidates, jobs, assessments),
-                assessmentIntelligenceTools(assessments),
-                jobIntelligenceTools(jobs, candidates),
+                candidateProfileTools(talentProfileClient, jobSyncClient, profileTransformer, jobTransformer),
+                applicationIntelligenceTools(cxApplicationsClient, talentProfileClient, jobSyncClient,
+                                            applicationTransformer, profileTransformer, jobTransformer),
+                assessmentIntelligenceTools(talentProfileClient, profileTransformer),
+                jobIntelligenceTools(jobSyncClient, talentProfileClient, jobTransformer, profileTransformer),
                 atsKnowledgeTools()
         ).flatMap(List::stream).toList();
     }
@@ -141,7 +156,8 @@ public class CandidateMcpConfiguration {
     // ------------------------------------------------------------------ candidate profile & discovery
 
     private List<McpStatelessServerFeatures.SyncToolSpecification> candidateProfileTools(
-            CandidateService candidates, JobService jobs) {
+            TalentProfileClient talentProfileClient, JobSyncClient jobSyncClient,
+            ProfileTransformer profileTransformer, JobTransformer jobTransformer) {
         return List.of(
 
             tool("getCandidateProfile",
@@ -154,8 +170,11 @@ public class CandidateMcpConfiguration {
                 (ctx, req) -> {
                     String id = str(req, "candidateId");
                     logCtx(ctx, "getCandidateProfile", id);
-                    return candidates.findById(id)
-                            .map(c -> ok(toJson(c), c))
+                    return talentProfileClient.getProfileV2(id)
+                            .map(profile -> {
+                                ProfileAgentContext agentCtx = profileTransformer.transform(profile);
+                                return ok(toJson(agentCtx), agentCtx);
+                            })
                             .orElse(err("Candidate not found: " + id));
                 }),
 
@@ -172,8 +191,26 @@ public class CandidateMcpConfiguration {
                     String cid = str(req, "candidateId");
                     int minScore = intArg(req, "minScore", 40);
                     logCtx(ctx, "getJobsMatchingCandidate", cid);
-                    return candidates.findById(cid).map(c -> {
-                        List<Map<String, Object>> matches = jobs.findMatchingJobs(c, minScore);
+                    return talentProfileClient.getProfileV2(cid).map(profile -> {
+                        ProfileAgentContext profileCtx = profileTransformer.transform(profile);
+                        List<JobRequisitionDocument> activeJobs = jobSyncClient.getActiveJobs();
+                        List<Map<String, Object>> matches = activeJobs.stream()
+                                .map(job -> {
+                                    JobAgentContext jobCtx = jobTransformer.transform(job);
+                                    int score = calculateMatchScore(profileCtx, jobCtx);
+                                    if (score < minScore) return null;
+                                    Map<String, Object> match = new LinkedHashMap<>();
+                                    match.put("jobId", jobCtx.jobId());
+                                    match.put("title", jobCtx.title());
+                                    match.put("department", jobCtx.department());
+                                    match.put("location", jobCtx.location());
+                                    match.put("matchScore", score);
+                                    match.put("salaryRange", jobCtx.salaryRangeDisplay());
+                                    return match;
+                                })
+                                .filter(Objects::nonNull)
+                                .sorted((a, b) -> Integer.compare((Integer)b.get("matchScore"), (Integer)a.get("matchScore")))
+                                .toList();
                         if (matches.isEmpty()) return ok("No open jobs meet the minimum match score of " + minScore + " for candidate " + cid);
                         return ok(toJson(matches), matches);
                     }).orElse(err("Candidate not found: " + cid));
@@ -197,10 +234,11 @@ public class CandidateMcpConfiguration {
                             ? (List<String>) l : List.of();
                     String location   = str(req, "location");
                     String department = str(req, "department");
-                    List<JobRequisition> result = jobs.findActive().stream()
+                    List<JobAgentContext> result = jobSyncClient.getActiveJobs().stream()
+                            .map(jobTransformer::transform)
                             .filter(j -> skills.isEmpty() || skills.stream().anyMatch(s ->
-                                    j.requiredSkills().stream().anyMatch(rs -> rs.equalsIgnoreCase(s))
-                                    || j.preferredSkills().stream().anyMatch(ps -> ps.equalsIgnoreCase(s))))
+                                    j.requirements().requiredSkills().stream().anyMatch(rs -> rs.equalsIgnoreCase(s))
+                                    || j.requirements().preferredSkills().stream().anyMatch(ps -> ps.equalsIgnoreCase(s))))
                             .filter(j -> location == null || j.location().toLowerCase().contains(location.toLowerCase()))
                             .filter(j -> department == null || j.department().equalsIgnoreCase(department))
                             .toList();
@@ -209,11 +247,39 @@ public class CandidateMcpConfiguration {
         );
     }
 
+    // Helper method for match scoring
+    private int calculateMatchScore(ProfileAgentContext profile, JobAgentContext job) {
+        if (profile.skills() == null || job.requirements() == null) return 0;
+
+        Set<String> candidateSkills = profile.skills().stream()
+                .map(s -> s.skill().toLowerCase())
+                .collect(java.util.stream.Collectors.toSet());
+
+        long requiredMatches = job.requirements().requiredSkills().stream()
+                .filter(skill -> candidateSkills.contains(skill.toLowerCase()))
+                .count();
+
+        long preferredMatches = job.requirements().preferredSkills().stream()
+                .filter(skill -> candidateSkills.contains(skill.toLowerCase()))
+                .count();
+
+        int requiredSize = job.requirements().requiredSkills().size();
+        int preferredSize = job.requirements().preferredSkills().size();
+
+        if (requiredSize == 0) return 0;
+
+        int requiredScore = (int)((requiredMatches * 100.0) / requiredSize);
+        int preferredScore = preferredSize > 0 ? (int)((preferredMatches * 100.0) / preferredSize) : 0;
+
+        return (int)(requiredScore * 0.7 + preferredScore * 0.3);
+    }
+
     // ------------------------------------------------------------------ application intelligence
 
     private List<McpStatelessServerFeatures.SyncToolSpecification> applicationIntelligenceTools(
-            ApplicationService applications, CandidateService candidates,
-            JobService jobs, AssessmentService assessments) {
+            CxApplicationsClient cxApplicationsClient, TalentProfileClient talentProfileClient,
+            JobSyncClient jobSyncClient, ApplicationTransformer applicationTransformer,
+            ProfileTransformer profileTransformer, JobTransformer jobTransformer) {
         return List.of(
 
             tool("getApplicationStatus",
@@ -227,25 +293,26 @@ public class CandidateMcpConfiguration {
                 (ctx, req) -> {
                     String id = str(req, "applicationId");
                     logCtx(ctx, "getApplicationStatus", id);
-                    return applications.findById(id).map(a -> {
-                        long daysInStage = applications.daysInCurrentStage(a);
-                        int  sla         = STAGE_SLA_DAYS.getOrDefault(a.status(), 999);
-                        String slaStatus = daysInStage > sla ? "OVERDUE by " + (daysInStage - sla) + " days"
-                                         : daysInStage == sla ? "AT_LIMIT"
-                                         : "ON_TRACK (" + (sla - daysInStage) + " days remaining)";
-                        String latestNote = a.notes().isEmpty() ? null
-                                : a.notes().get(a.notes().size() - 1).note();
+                    return cxApplicationsClient.getApplication(id).map(app -> {
+                        ApplicationAgentContext agentCtx = applicationTransformer.transform(app);
+                        int sla = STAGE_SLA_DAYS.getOrDefault(agentCtx.status(), 999);
+                        String slaStatus = agentCtx.slaBreached() ? "OVERDUE by " + (agentCtx.daysInCurrentStage() - sla) + " days"
+                                         : agentCtx.daysInCurrentStage() == sla ? "AT_LIMIT"
+                                         : "ON_TRACK (" + (sla - agentCtx.daysInCurrentStage()) + " days remaining)";
+                        String latestNote = agentCtx.publicNotes().isEmpty() ? null
+                                : agentCtx.publicNotes().get(agentCtx.publicNotes().size() - 1).note();
                         Map<String, Object> view = new LinkedHashMap<>();
-                        view.put("applicationId",       a.id());
-                        view.put("candidateId",         a.candidateId());
-                        view.put("jobId",               a.jobId());
-                        view.put("currentStatus",       a.status());
-                        view.put("currentInterviewRound", a.currentInterviewRound());
-                        view.put("source",              a.source());
-                        view.put("appliedAt",           a.appliedAt());
-                        view.put("daysInCurrentStage",  daysInStage);
+                        view.put("applicationId",       agentCtx.applicationId());
+                        view.put("candidateId",         agentCtx.candidateId());
+                        view.put("jobId",               agentCtx.jobId());
+                        view.put("currentStatus",       agentCtx.status());
+                        view.put("currentStage",        agentCtx.currentStage());
+                        view.put("source",              agentCtx.source());
+                        view.put("appliedAt",           agentCtx.appliedAt());
+                        view.put("daysInCurrentStage",  agentCtx.daysInCurrentStage());
                         view.put("slaStatus",           slaStatus);
-                        view.put("totalStages",         a.statusHistory().size());
+                        view.put("slaBreached",         agentCtx.slaBreached());
+                        view.put("totalStages",         agentCtx.workflowSummary().size());
                         view.put("latestNote",          latestNote);
                         return ok(toJson(view), view);
                     }).orElse(err("Application not found: " + id));
@@ -261,16 +328,18 @@ public class CandidateMcpConfiguration {
                 (ctx, req) -> {
                     String cid = str(req, "candidateId");
                     logCtx(ctx, "getApplicationsByCandidate", cid);
-                    if (candidates.findById(cid).isEmpty()) return err("Candidate not found: " + cid);
-                    List<Application> apps = applications.findByCandidate(cid);
+                    if (talentProfileClient.getProfileV2(cid).isEmpty()) return err("Candidate not found: " + cid);
+                    List<AtsApplication> apps = cxApplicationsClient.getApplicationsByCandidate(cid);
                     List<Map<String, Object>> summary = apps.stream().map(a -> {
+                        ApplicationAgentContext agentCtx = applicationTransformer.transform(a);
                         Map<String, Object> m = new LinkedHashMap<>();
-                        m.put("applicationId",  a.id());
-                        m.put("jobId",          a.jobId());
-                        m.put("jobTitle",       jobs.findById(a.jobId()).map(JobRequisition::title).orElse("Unknown"));
-                        m.put("status",         a.status());
-                        m.put("appliedAt",      a.appliedAt());
-                        m.put("daysInPipeline", ChronoUnit.DAYS.between(a.appliedAt(), java.time.LocalDateTime.now()));
+                        m.put("applicationId",  agentCtx.applicationId());
+                        m.put("jobId",          agentCtx.jobId());
+                        m.put("jobTitle",       jobSyncClient.getJob(agentCtx.jobId())
+                                .map(job -> jobTransformer.transform(job).title()).orElse("Unknown"));
+                        m.put("status",         agentCtx.status());
+                        m.put("appliedAt",      agentCtx.appliedAt());
+                        m.put("daysInPipeline", ChronoUnit.DAYS.between(agentCtx.appliedAt(), java.time.LocalDateTime.now()));
                         return m;
                     }).toList();
                     return ok(toJson(summary), summary);
@@ -287,34 +356,33 @@ public class CandidateMcpConfiguration {
                 (ctx, req) -> {
                     String cid = str(req, "candidateId");
                     logCtx(ctx, "getCandidateJourney", cid);
-                    return candidates.findById(cid).map(c -> {
-                        List<Application> apps = applications.findByCandidate(cid);
-                        List<Map<String, Object>> appViews = apps.stream().map(a -> {
+                    return talentProfileClient.getProfileV2(cid).map(profile -> {
+                        ProfileAgentContext profileCtx = profileTransformer.transform(profile);
+                        List<AtsApplication> apps = cxApplicationsClient.getApplicationsByCandidate(cid);
+                        List<Map<String, Object>> appViews = apps.stream().map(app -> {
+                            ApplicationAgentContext agentCtx = applicationTransformer.transform(app);
                             Map<String, Object> av = new LinkedHashMap<>();
-                            av.put("applicationId",      a.id());
-                            av.put("jobId",              a.jobId());
-                            av.put("jobTitle",           jobs.findById(a.jobId()).map(JobRequisition::title).orElse("Unknown"));
-                            av.put("status",             a.status());
-                            av.put("source",             a.source());
-                            av.put("appliedAt",          a.appliedAt());
-                            av.put("daysInPipeline",     ChronoUnit.DAYS.between(a.appliedAt(), java.time.LocalDateTime.now()));
-                            av.put("daysInCurrentStage", applications.daysInCurrentStage(a));
-                            av.put("currentInterviewRound", a.currentInterviewRound());
-                            av.put("statusHistory",      a.statusHistory());
-                            av.put("assessments",        assessments.findByApplication(a.id())
-                                    .stream().map(ar -> Map.of(
-                                            "type",        ar.type(),
-                                            "score",       ar.score(),
-                                            "maxScore",    ar.maxScore(),
-                                            "percentile",  ar.percentile(),
-                                            "completedAt", ar.completedAt())).toList());
-                            av.put("recruiterNotes",     a.notes().size());
+                            av.put("applicationId",      agentCtx.applicationId());
+                            av.put("jobId",              agentCtx.jobId());
+                            av.put("jobTitle",           jobSyncClient.getJob(agentCtx.jobId())
+                                    .map(job -> jobTransformer.transform(job).title()).orElse("Unknown"));
+                            av.put("status",             agentCtx.status());
+                            av.put("source",             agentCtx.source());
+                            av.put("appliedAt",          agentCtx.appliedAt());
+                            av.put("daysInPipeline",     ChronoUnit.DAYS.between(agentCtx.appliedAt(), java.time.LocalDateTime.now()));
+                            av.put("daysInCurrentStage", agentCtx.daysInCurrentStage());
+                            av.put("currentStage",       agentCtx.currentStage());
+                            av.put("workflowSummary",    agentCtx.workflowSummary());
+                            av.put("assessmentSummary",  Map.of(
+                                    "totalCompleted", profileCtx.totalAssessmentsCompleted(),
+                                    "averagePercentiles", profileCtx.averagePercentilesByType()));
+                            av.put("recruiterNotesCount", agentCtx.publicNotes().size());
                             return av;
                         }).toList();
                         Map<String, Object> journey = new LinkedHashMap<>();
-                        journey.put("candidateId",       c.id());
-                        journey.put("name",              c.name());
-                        journey.put("status",            c.status());
+                        journey.put("candidateId",       profileCtx.candidateId());
+                        journey.put("name",              profileCtx.displayName());
+                        journey.put("status",            profileCtx.status());
                         journey.put("totalApplications", apps.size());
                         journey.put("activeApplications",apps.stream().filter(a -> a.status() != ApplicationStatus.REJECTED
                                 && a.status() != ApplicationStatus.WITHDRAWN
@@ -335,17 +403,17 @@ public class CandidateMcpConfiguration {
                 (ctx, req) -> {
                     String id = str(req, "applicationId");
                     logCtx(ctx, "getNextSteps", id);
-                    return applications.findById(id).map(a -> {
-                        Map<String, Object> guidance = STAGE_GUIDANCE.getOrDefault(a.status(),
-                                Map.of("what_is_happening", "Status: " + a.status(),
+                    return cxApplicationsClient.getApplication(id).map(app -> {
+                        ApplicationAgentContext agentCtx = applicationTransformer.transform(app);
+                        Map<String, Object> guidance = STAGE_GUIDANCE.getOrDefault(agentCtx.status(),
+                                Map.of("what_is_happening", "Status: " + agentCtx.status(),
                                        "candidate_action",  "Contact your recruiter for details.",
                                        "typical_wait",      "Varies", "possible_next", List.of()));
-                        long daysInStage = applications.daysInCurrentStage(a);
                         Map<String, Object> result = new LinkedHashMap<>(guidance);
-                        result.put("applicationId",    a.id());
-                        result.put("currentStatus",    a.status());
-                        result.put("daysInStage",      daysInStage);
-                        result.put("sla_days",         STAGE_SLA_DAYS.getOrDefault(a.status(), 0));
+                        result.put("applicationId",    agentCtx.applicationId());
+                        result.put("currentStatus",    agentCtx.status());
+                        result.put("daysInStage",      agentCtx.daysInCurrentStage());
+                        result.put("sla_days",         STAGE_SLA_DAYS.getOrDefault(agentCtx.status(), 0));
                         return ok(toJson(result), result);
                     }).orElse(err("Application not found: " + id));
                 }),
@@ -361,16 +429,17 @@ public class CandidateMcpConfiguration {
                 (ctx, req) -> {
                     String id = str(req, "applicationId");
                     logCtx(ctx, "getInterviewFeedback", id);
-                    return applications.findById(id).map(a -> {
-                        List<Map<String, Object>> feedback = a.notes().stream()
+                    return cxApplicationsClient.getApplication(id).map(app -> {
+                        ApplicationAgentContext agentCtx = applicationTransformer.transform(app);
+                        List<Map<String, Object>> feedback = agentCtx.publicNotes().stream()
                                 .map(n -> Map.<String, Object>of(
                                         "from",       n.authorName(),
                                         "date",       n.createdAt(),
                                         "observation", n.note()))
                                 .toList();
                         Map<String, Object> result = Map.of(
-                                "applicationId", a.id(),
-                                "stage",         a.status(),
+                                "applicationId", agentCtx.applicationId(),
+                                "stage",         agentCtx.status(),
                                 "feedbackCount", feedback.size(),
                                 "feedback",      feedback);
                         return ok(toJson(result), result);
@@ -387,19 +456,88 @@ public class CandidateMcpConfiguration {
                 (ctx, req) -> {
                     String id = str(req, "applicationId");
                     logCtx(ctx, "getStageDuration", id);
-                    return applications.findById(id).map(a -> {
-                        long days = applications.daysInCurrentStage(a);
-                        int  sla  = STAGE_SLA_DAYS.getOrDefault(a.status(), 0);
+                    return cxApplicationsClient.getApplication(id).map(app -> {
+                        ApplicationAgentContext agentCtx = applicationTransformer.transform(app);
+                        int sla = STAGE_SLA_DAYS.getOrDefault(agentCtx.status(), 0);
                         Map<String, Object> result = new LinkedHashMap<>();
-                        result.put("applicationId",      a.id());
-                        result.put("currentStatus",      a.status());
-                        result.put("daysInCurrentStage", days);
+                        result.put("applicationId",      agentCtx.applicationId());
+                        result.put("currentStatus",      agentCtx.status());
+                        result.put("daysInCurrentStage", agentCtx.daysInCurrentStage());
                         result.put("expectedSLADays",    sla);
-                        result.put("slaBreached",        sla > 0 && days > sla);
-                        result.put("breachByDays",       sla > 0 ? Math.max(0, days - sla) : null);
-                        result.put("lastChangedAt",      applications.lastStatusChange(a));
+                        result.put("slaBreached",        agentCtx.slaBreached());
+                        result.put("breachByDays",       agentCtx.slaBreached() ? agentCtx.daysInCurrentStage() - sla : 0);
+                        result.put("lastChangedAt",      agentCtx.workflowSummary().isEmpty() ? null :
+                                agentCtx.workflowSummary().get(agentCtx.workflowSummary().size() - 1).enteredAt());
                         return ok(toJson(result), result);
                     }).orElse(err("Application not found: " + id));
+                }),
+
+            // NEW ENTERPRISE TOOLS
+
+            tool("getApplicationGroup",
+                "Get Application Group (Draft Multi-Job Application)",
+                "Retrieve a draft application group where candidate can apply to multiple jobs in one session.",
+                READ_ONLY,
+                schema(Map.of("groupId", prop("string", "Application Group ID, e.g. AG001")),
+                       List.of("groupId")),
+                (ctx, req) -> {
+                    String id = str(req, "groupId");
+                    logCtx(ctx, "getApplicationGroup", id);
+                    return cxApplicationsClient.getApplicationGroup(id)
+                            .map(ag -> ok(toJson(ag), ag))
+                            .orElse(err("ApplicationGroup not found: " + id));
+                }),
+
+            tool("getApplicationGroupsByCandidate",
+                "Get Application Groups by Candidate",
+                "Retrieve all draft application groups (multi-job applications) for a candidate.",
+                READ_ONLY,
+                schema(Map.of("candidateId", prop("string", "Candidate ID")),
+                       List.of("candidateId")),
+                (ctx, req) -> {
+                    String id = str(req, "candidateId");
+                    logCtx(ctx, "getApplicationGroupsByCandidate", id);
+                    List<ApplicationGroup> groups = cxApplicationsClient.getApplicationGroupsByCandidate(id);
+                    return ok(toJson(groups), groups);
+                }),
+
+            tool("getCandidatePreferences",
+                "Get Candidate Preferences",
+                "Retrieve candidate's location, job, and work style preferences including shift preferences.",
+                READ_ONLY,
+                schema(Map.of("candidateId", prop("string", "Candidate ID")),
+                       List.of("candidateId")),
+                (ctx, req) -> {
+                    String id = str(req, "candidateId");
+                    logCtx(ctx, "getCandidatePreferences", id);
+                    return talentProfileClient.getProfileV2(id)
+                            .map(profile -> {
+                                ProfileAgentContext agentCtx = profileTransformer.transform(profile);
+                                Map<String, Object> prefs = Map.of(
+                                    "location", agentCtx.locationPreferences(),
+                                    "job", agentCtx.jobPreferences(),
+                                    "workStyle", agentCtx.workStylePreferences()
+                                );
+                                return ok(toJson(prefs), prefs);
+                            })
+                            .orElse(err("Candidate not found: " + id));
+                }),
+
+            tool("getScheduledEvents",
+                "Get Scheduled Interview Events",
+                "Retrieve upcoming interview and event schedule for an application.",
+                READ_ONLY,
+                schema(Map.of("applicationId", prop("string", "Application ID")),
+                       List.of("applicationId")),
+                (ctx, req) -> {
+                    String id = str(req, "applicationId");
+                    logCtx(ctx, "getScheduledEvents", id);
+                    return cxApplicationsClient.getApplication(id)
+                            .map(app -> {
+                                ApplicationAgentContext agentCtx = applicationTransformer.transform(app);
+                                return ok(toJson(agentCtx.upcomingEvents()), agentCtx.upcomingEvents());
+                            })
+                            .orElse(err("Application not found: " + id));
                 })
         );
     }
@@ -407,7 +545,7 @@ public class CandidateMcpConfiguration {
     // ------------------------------------------------------------------ assessment intelligence
 
     private List<McpStatelessServerFeatures.SyncToolSpecification> assessmentIntelligenceTools(
-            AssessmentService assessments) {
+            TalentProfileClient talentProfileClient, ProfileTransformer profileTransformer) {
         return List.of(
 
             tool("getAssessmentResults",
@@ -421,15 +559,17 @@ public class CandidateMcpConfiguration {
                 (ctx, req) -> {
                     String cid = str(req, "candidateId");
                     logCtx(ctx, "getAssessmentResults", cid);
-                    List<AssessmentResult> results = assessments.findByCandidate(cid);
-                    if (results.isEmpty()) return ok("No assessments found for candidate " + cid);
-                    OptionalDouble avg = assessments.averageScorePercent(cid);
-                    Map<String, Object> view = new LinkedHashMap<>();
-                    view.put("candidateId",         cid);
-                    view.put("totalAssessments",    results.size());
-                    view.put("averageScorePercent", avg.isPresent() ? Math.round(avg.getAsDouble() * 10.0) / 10.0 : null);
-                    view.put("assessments",         results);
-                    return ok(toJson(view), view);
+                    return talentProfileClient.getProfileV2(cid).map(profile -> {
+                        ProfileAgentContext agentCtx = profileTransformer.transform(profile);
+                        var results = profile.assessments().results();
+                        if (results.isEmpty()) return ok("No assessments found for candidate " + cid);
+                        Map<String, Object> view = new LinkedHashMap<>();
+                        view.put("candidateId",              cid);
+                        view.put("totalAssessments",         agentCtx.totalAssessmentsCompleted());
+                        view.put("averagePercentilesByType", agentCtx.averagePercentilesByType());
+                        view.put("assessments",              results);
+                        return ok(toJson(view), view);
+                    }).orElse(err("Candidate not found: " + cid));
                 }),
 
             tool("getAssessmentByType",
@@ -439,21 +579,25 @@ public class CandidateMcpConfiguration {
                 schema(Map.of(
                     "candidateId",   prop("string", "Candidate ID"),
                     "assessmentType",propEnum("Assessment type to query",
-                            "CODING_CHALLENGE","SYSTEM_DESIGN","TECHNICAL_SCREENING",
-                            "BEHAVIORAL","COGNITIVE","TAKE_HOME_PROJECT")),
+                            "CODING","SYSTEM_DESIGN","TECHNICAL","BEHAVIORAL")),
                     List.of("candidateId", "assessmentType")),
                 (ctx, req) -> {
                     String cid = str(req, "candidateId");
                     String raw = str(req, "assessmentType");
                     logCtx(ctx, "getAssessmentByType", cid + "/" + raw);
-                    try {
-                        AssessmentType type = AssessmentType.valueOf(raw);
-                        return assessments.findByCandidateAndType(cid, type)
-                                .map(a -> ok(toJson(a), a))
-                                .orElse(ok("No " + raw + " assessment on record for candidate " + cid));
-                    } catch (IllegalArgumentException e) {
-                        return err("Invalid assessment type: " + raw);
-                    }
+                    return talentProfileClient.getProfileV2(cid).map(profile -> {
+                        try {
+                            AssessmentType type =
+                                    AssessmentType.valueOf(raw);
+                            return profile.assessments().results().stream()
+                                    .filter(a -> a.type() == type)
+                                    .reduce((first, second) -> second) // Get most recent
+                                    .map(a -> ok(toJson(a), a))
+                                    .orElse(ok("No " + raw + " assessment on record for candidate " + cid));
+                        } catch (IllegalArgumentException e) {
+                            return err("Invalid assessment type: " + raw);
+                        }
+                    }).orElse(err("Candidate not found: " + cid));
                 }),
 
             tool("compareToPercentile",
@@ -464,34 +608,36 @@ public class CandidateMcpConfiguration {
                 READ_ONLY,
                 schema(Map.of(
                     "candidateId",  prop("string", "Candidate ID"),
-                    "assessmentId", prop("string", "Assessment result ID, e.g. AS001")),
-                    List.of("candidateId", "assessmentId")),
+                    "assessmentCode", prop("string", "Assessment result code, e.g. CODING_001")),
+                    List.of("candidateId", "assessmentCode")),
                 (ctx, req) -> {
                     String cid = str(req, "candidateId");
-                    String aid = str(req, "assessmentId");
-                    logCtx(ctx, "compareToPercentile", aid);
-                    return assessments.findByCandidate(cid).stream()
-                            .filter(a -> a.id().equals(aid))
-                            .findFirst()
-                            .map(a -> {
-                                int pct = a.percentile();
-                                String label = pct >= 90 ? "Top 10% — exceptional"
-                                             : pct >= 75 ? "Top 25% — strong"
-                                             : pct >= 50 ? "Above average"
-                                             : pct >= 25 ? "Below average — room to grow"
-                                             :             "Bottom 25% — significant improvement needed";
-                                Map<String, Object> view = new LinkedHashMap<>();
-                                view.put("assessmentId",   a.id());
-                                view.put("type",           a.type());
-                                view.put("score",          a.score());
-                                view.put("maxScore",       a.maxScore());
-                                view.put("scorePercent",   Math.round(a.scorePercent() * 10.0) / 10.0);
-                                view.put("percentile",     pct);
-                                view.put("interpretation", label);
-                                view.put("beatCandidates", pct + "% of all candidates who attempted this assessment");
-                                view.put("summary",        a.summary());
-                                return ok(toJson(view), view);
-                            }).orElse(err("Assessment " + aid + " not found for candidate " + cid));
+                    String code = str(req, "assessmentCode");
+                    logCtx(ctx, "compareToPercentile", code);
+                    return talentProfileClient.getProfileV2(cid).map(profile -> {
+                        return profile.assessments().results().stream()
+                                .filter(a -> a.assessmentCode().equals(code))
+                                .findFirst()
+                                .map(a -> {
+                                    int pct = a.percentile();
+                                    String label = pct >= 90 ? "Top 10% — exceptional"
+                                                 : pct >= 75 ? "Top 25% — strong"
+                                                 : pct >= 50 ? "Above average"
+                                                 : pct >= 25 ? "Below average — room to grow"
+                                                 :             "Bottom 25% — significant improvement needed";
+                                    Map<String, Object> view = new LinkedHashMap<>();
+                                    view.put("assessmentCode",  a.assessmentCode());
+                                    view.put("type",            a.type());
+                                    view.put("score",           a.score());
+                                    view.put("maxScore",        a.maxScore());
+                                    view.put("scorePercent",    Math.round((a.score() / a.maxScore() * 100.0) * 10.0) / 10.0);
+                                    view.put("percentile",      pct);
+                                    view.put("interpretation",  label);
+                                    view.put("beatCandidates",  pct + "% of all candidates who attempted this assessment");
+                                    view.put("completedAt",     a.completedAt());
+                                    return ok(toJson(view), view);
+                                }).orElse(err("Assessment " + code + " not found for candidate " + cid));
+                    }).orElse(err("Candidate not found: " + cid));
                 })
         );
     }
@@ -499,7 +645,8 @@ public class CandidateMcpConfiguration {
     // ------------------------------------------------------------------ job intelligence
 
     private List<McpStatelessServerFeatures.SyncToolSpecification> jobIntelligenceTools(
-            JobService jobs, CandidateService candidates) {
+            JobSyncClient jobSyncClient, TalentProfileClient talentProfileClient,
+            JobTransformer jobTransformer, ProfileTransformer profileTransformer) {
         return List.of(
 
             tool("getJob",
@@ -512,8 +659,11 @@ public class CandidateMcpConfiguration {
                 (ctx, req) -> {
                     String jid = str(req, "jobId");
                     logCtx(ctx, "getJob", jid);
-                    return jobs.findById(jid)
-                            .map(j -> ok(toJson(j), j))
+                    return jobSyncClient.getJob(jid)
+                            .map(job -> {
+                                JobAgentContext agentCtx = jobTransformer.transform(job);
+                                return ok(toJson(agentCtx), agentCtx);
+                            })
                             .orElse(err("Job not found: " + jid));
                 }),
 
@@ -526,8 +676,11 @@ public class CandidateMcpConfiguration {
                 (ctx, req) -> {
                     logCtx(ctx, "listOpenJobs", str(req, "department"));
                     String dept = str(req, "department");
-                    List<JobRequisition> result = dept != null
-                            ? jobs.findByDepartment(dept) : jobs.findActive();
+                    List<JobAgentContext> result = dept != null
+                            ? jobSyncClient.getJobsByDepartment(dept).stream()
+                                    .map(jobTransformer::transform).toList()
+                            : jobSyncClient.getActiveJobs().stream()
+                                    .map(jobTransformer::transform).toList();
                     return ok(toJson(result), result);
                 }),
 
@@ -545,11 +698,48 @@ public class CandidateMcpConfiguration {
                     String cid = str(req, "candidateId");
                     String jid = str(req, "jobId");
                     logCtx(ctx, "getSkillsGap", cid + " → " + jid);
-                    Optional<Candidate>      c = candidates.findById(cid);
-                    Optional<JobRequisition> j = jobs.findById(jid);
-                    if (c.isEmpty()) return err("Candidate not found: " + cid);
-                    if (j.isEmpty()) return err("Job not found: " + jid);
-                    Map<String, Object> gap = jobs.matchScore(c.get(), j.get());
+                    Optional<CandidateProfileV2> profile = talentProfileClient.getProfileV2(cid);
+                    Optional<JobRequisitionDocument> job = jobSyncClient.getJob(jid);
+                    if (profile.isEmpty()) return err("Candidate not found: " + cid);
+                    if (job.isEmpty()) return err("Job not found: " + jid);
+
+                    ProfileAgentContext profileCtx = profileTransformer.transform(profile.get());
+                    JobAgentContext jobCtx = jobTransformer.transform(job.get());
+
+                    Set<String> candidateSkills = profileCtx.skills().stream()
+                            .map(s -> s.skill().toLowerCase())
+                            .collect(java.util.stream.Collectors.toSet());
+
+                    List<String> requiredSkillsHave = jobCtx.requirements().requiredSkills().stream()
+                            .filter(s -> candidateSkills.contains(s.toLowerCase()))
+                            .toList();
+
+                    List<String> requiredSkillsLack = jobCtx.requirements().requiredSkills().stream()
+                            .filter(s -> !candidateSkills.contains(s.toLowerCase()))
+                            .toList();
+
+                    List<String> preferredSkillsHave = jobCtx.requirements().preferredSkills().stream()
+                            .filter(s -> candidateSkills.contains(s.toLowerCase()))
+                            .toList();
+
+                    List<String> preferredSkillsLack = jobCtx.requirements().preferredSkills().stream()
+                            .filter(s -> !candidateSkills.contains(s.toLowerCase()))
+                            .toList();
+
+                    int matchScore = calculateMatchScore(profileCtx, jobCtx);
+
+                    Map<String, Object> gap = new LinkedHashMap<>();
+                    gap.put("candidateId", cid);
+                    gap.put("jobId", jid);
+                    gap.put("matchScore", matchScore);
+                    gap.put("requiredSkillsCovered", requiredSkillsHave);
+                    gap.put("requiredSkillsMissing", requiredSkillsLack);
+                    gap.put("preferredSkillsCovered", preferredSkillsHave);
+                    gap.put("preferredSkillsMissing", preferredSkillsLack);
+                    gap.put("requiredAssessmentCodes", jobCtx.requiredAssessmentCodes());
+                    gap.put("fitLevel", matchScore >= 80 ? "STRONG_FIT" :
+                                       matchScore >= 60 ? "GOOD_FIT" :
+                                       matchScore >= 40 ? "MODERATE_FIT" : "WEAK_FIT");
                     return ok(toJson(gap), gap);
                 })
         );
@@ -662,10 +852,12 @@ public class CandidateMcpConfiguration {
 
     @Bean
     public List<McpStatelessServerFeatures.SyncResourceTemplateSpecification> resourceTemplates(
-            CandidateService candidates,
-            ApplicationService applications,
-            AssessmentService assessments,
-            JobService jobs) {
+            TalentProfileClient talentProfileClient,
+            CxApplicationsClient cxApplicationsClient,
+            JobSyncClient jobSyncClient,
+            ProfileTransformer profileTransformer,
+            ApplicationTransformer applicationTransformer,
+            JobTransformer jobTransformer) {
         return List.of(
 
             template("candidate://{candidateId}/profile",
@@ -674,8 +866,11 @@ public class CandidateMcpConfiguration {
                 "application/json",
                 (ctx, req) -> {
                     String id = seg(req.uri(), "candidate://", "/profile");
-                    return candidates.findById(id)
-                            .map(c -> jsonResource(req.uri(), toJson(c)))
+                    return talentProfileClient.getProfileV2(id)
+                            .map(profile -> {
+                                ProfileAgentContext agentCtx = profileTransformer.transform(profile);
+                                return jsonResource(req.uri(), toJson(agentCtx));
+                            })
                             .orElseThrow(() -> new IllegalArgumentException("Candidate not found: " + id));
                 }),
 
@@ -685,7 +880,9 @@ public class CandidateMcpConfiguration {
                 "application/json",
                 (ctx, req) -> {
                     String id = seg(req.uri(), "candidate://", "/applications");
-                    return jsonResource(req.uri(), toJson(applications.findByCandidate(id)));
+                    List<ApplicationAgentContext> apps = cxApplicationsClient.getApplicationsByCandidate(id).stream()
+                            .map(applicationTransformer::transform).toList();
+                    return jsonResource(req.uri(), toJson(apps));
                 }),
 
             template("candidate://{candidateId}/assessments",
@@ -694,7 +891,9 @@ public class CandidateMcpConfiguration {
                 "application/json",
                 (ctx, req) -> {
                     String id = seg(req.uri(), "candidate://", "/assessments");
-                    return jsonResource(req.uri(), toJson(assessments.findByCandidate(id)));
+                    return talentProfileClient.getProfileV2(id)
+                            .map(profile -> jsonResource(req.uri(), toJson(profile.assessments().results())))
+                            .orElseThrow(() -> new IllegalArgumentException("Candidate not found: " + id));
                 }),
 
             template("candidate://{candidateId}/open-actions",
@@ -703,20 +902,22 @@ public class CandidateMcpConfiguration {
                 "application/json",
                 (ctx, req) -> {
                     String id = seg(req.uri(), "candidate://", "/open-actions");
-                    List<Application> open = applications.findByCandidate(id).stream()
+                    List<AtsApplication> open = cxApplicationsClient.getApplicationsByCandidate(id).stream()
                             .filter(a -> a.status() != ApplicationStatus.REJECTED
                                     && a.status() != ApplicationStatus.WITHDRAWN
                                     && a.status() != ApplicationStatus.HIRED
                                     && a.status() != ApplicationStatus.OFFER_DECLINED)
                             .toList();
-                    List<Map<String, Object>> actions = open.stream().map(a -> {
+                    List<Map<String, Object>> actions = open.stream().map(app -> {
+                        ApplicationAgentContext agentCtx = applicationTransformer.transform(app);
                         Map<String, Object> m = new LinkedHashMap<>();
-                        m.put("applicationId", a.id());
-                        m.put("jobId",         a.jobId());
-                        m.put("jobTitle",      jobs.findById(a.jobId()).map(JobRequisition::title).orElse("Unknown"));
-                        m.put("currentStatus", a.status());
-                        m.put("daysInStage",   applications.daysInCurrentStage(a));
-                        m.put("candidateAction", STAGE_GUIDANCE.getOrDefault(a.status(), Map.of())
+                        m.put("applicationId", agentCtx.applicationId());
+                        m.put("jobId",         agentCtx.jobId());
+                        m.put("jobTitle",      jobSyncClient.getJob(agentCtx.jobId())
+                                .map(job -> jobTransformer.transform(job).title()).orElse("Unknown"));
+                        m.put("currentStatus", agentCtx.status());
+                        m.put("daysInStage",   agentCtx.daysInCurrentStage());
+                        m.put("candidateAction", STAGE_GUIDANCE.getOrDefault(agentCtx.status(), Map.of())
                                 .getOrDefault("candidate_action", "Contact recruiter for details"));
                         return m;
                     }).toList();
@@ -729,8 +930,11 @@ public class CandidateMcpConfiguration {
                 "application/json",
                 (ctx, req) -> {
                     String id = seg(req.uri(), "application://", "/timeline");
-                    return applications.findById(id)
-                            .map(a -> jsonResource(req.uri(), toJson(a.statusHistory())))
+                    return cxApplicationsClient.getApplication(id)
+                            .map(app -> {
+                                ApplicationAgentContext agentCtx = applicationTransformer.transform(app);
+                                return jsonResource(req.uri(), toJson(agentCtx.workflowSummary()));
+                            })
                             .orElseThrow(() -> new IllegalArgumentException("Application not found: " + id));
                 }),
 
@@ -740,20 +944,22 @@ public class CandidateMcpConfiguration {
                 "application/json",
                 (ctx, req) -> {
                     String id = seg(req.uri(), "candidate://", "/journey");
-                    return candidates.findById(id).map(c -> {
-                        List<Application> apps = applications.findByCandidate(id);
+                    return talentProfileClient.getProfileV2(id).map(profile -> {
+                        ProfileAgentContext profileCtx = profileTransformer.transform(profile);
+                        List<AtsApplication> apps = cxApplicationsClient.getApplicationsByCandidate(id);
                         Map<String, Object> journey = new LinkedHashMap<>();
-                        journey.put("candidateId",       c.id());
-                        journey.put("name",              c.name());
+                        journey.put("candidateId",       profileCtx.candidateId());
+                        journey.put("name",              profileCtx.displayName());
                         journey.put("totalApplications", apps.size());
-                        journey.put("applications",      apps.stream().map(a -> {
+                        journey.put("applications",      apps.stream().map(app -> {
+                            ApplicationAgentContext agentCtx = applicationTransformer.transform(app);
                             Map<String, Object> av = new LinkedHashMap<>();
-                            av.put("applicationId", a.id());
-                            av.put("jobId",         a.jobId());
-                            av.put("status",        a.status());
-                            av.put("appliedAt",     a.appliedAt());
-                            av.put("statusHistory", a.statusHistory());
-                            av.put("assessments",   assessments.findByApplication(a.id()));
+                            av.put("applicationId", agentCtx.applicationId());
+                            av.put("jobId",         agentCtx.jobId());
+                            av.put("status",        agentCtx.status());
+                            av.put("appliedAt",     agentCtx.appliedAt());
+                            av.put("workflowSummary", agentCtx.workflowSummary());
+                            av.put("assessments",   profile.assessments().results());
                             return av;
                         }).toList());
                         return jsonResource(req.uri(), toJson(journey));
@@ -770,10 +976,35 @@ public class CandidateMcpConfiguration {
                     String afterJob  = uri.substring("job://".length());
                     String jobId     = afterJob.substring(0, afterJob.indexOf("/match/"));
                     String candId    = afterJob.substring(afterJob.indexOf("/match/") + "/match/".length());
-                    Optional<Candidate>      c = candidates.findById(candId);
-                    Optional<JobRequisition> j = jobs.findById(jobId);
-                    if (c.isEmpty() || j.isEmpty()) throw new IllegalArgumentException("Candidate or job not found");
-                    return jsonResource(req.uri(), toJson(jobs.matchScore(c.get(), j.get())));
+                    Optional<CandidateProfileV2> profile = talentProfileClient.getProfileV2(candId);
+                    Optional<JobRequisitionDocument> job = jobSyncClient.getJob(jobId);
+                    if (profile.isEmpty() || job.isEmpty()) throw new IllegalArgumentException("Candidate or job not found");
+
+                    ProfileAgentContext profileCtx = profileTransformer.transform(profile.get());
+                    JobAgentContext jobCtx = jobTransformer.transform(job.get());
+
+                    Set<String> candidateSkills = profileCtx.skills().stream()
+                            .map(s -> s.skill().toLowerCase())
+                            .collect(java.util.stream.Collectors.toSet());
+
+                    List<String> requiredSkillsHave = jobCtx.requirements().requiredSkills().stream()
+                            .filter(s -> candidateSkills.contains(s.toLowerCase())).toList();
+                    List<String> requiredSkillsLack = jobCtx.requirements().requiredSkills().stream()
+                            .filter(s -> !candidateSkills.contains(s.toLowerCase())).toList();
+                    List<String> preferredSkillsHave = jobCtx.requirements().preferredSkills().stream()
+                            .filter(s -> candidateSkills.contains(s.toLowerCase())).toList();
+
+                    int matchScore = calculateMatchScore(profileCtx, jobCtx);
+
+                    Map<String, Object> gap = Map.of(
+                        "candidateId", candId,
+                        "jobId", jobId,
+                        "matchScore", matchScore,
+                        "requiredSkillsCovered", requiredSkillsHave,
+                        "requiredSkillsMissing", requiredSkillsLack,
+                        "preferredSkillsCovered", preferredSkillsHave
+                    );
+                    return jsonResource(req.uri(), toJson(gap));
                 })
         );
     }
@@ -784,10 +1015,12 @@ public class CandidateMcpConfiguration {
 
     @Bean
     public List<McpStatelessServerFeatures.SyncPromptSpecification> prompts(
-            CandidateService candidates,
-            ApplicationService applications,
-            AssessmentService assessments,
-            JobService jobs) {
+            TalentProfileClient talentProfileClient,
+            CxApplicationsClient cxApplicationsClient,
+            JobSyncClient jobSyncClient,
+            ProfileTransformer profileTransformer,
+            ApplicationTransformer applicationTransformer,
+            JobTransformer jobTransformer) {
         return List.of(
 
             prompt("application-status-narrative",
@@ -798,10 +1031,14 @@ public class CandidateMcpConfiguration {
                 (ctx, req) -> {
                     String cid = str(req.arguments(), "candidateId");
                     String aid = str(req.arguments(), "applicationId");
-                    String cJson = candidates.findById(cid).map(this::toJson).orElse("Not found");
-                    String aJson = applications.findById(aid).map(this::toJson).orElse("Not found");
-                    String guidanceJson = applications.findById(aid)
-                            .map(a -> toJson(STAGE_GUIDANCE.getOrDefault(a.status(), Map.of())))
+                    String cJson = talentProfileClient.getProfileV2(cid)
+                            .map(profile -> toJson(profileTransformer.transform(profile)))
+                            .orElse("Not found");
+                    String aJson = cxApplicationsClient.getApplication(aid)
+                            .map(app -> toJson(applicationTransformer.transform(app)))
+                            .orElse("Not found");
+                    String guidanceJson = cxApplicationsClient.getApplication(aid)
+                            .map(app -> toJson(STAGE_GUIDANCE.getOrDefault(app.status(), Map.of())))
                             .orElse("{}");
                     return promptResult("Application status narrative for " + cid,
                         """
@@ -835,11 +1072,19 @@ public class CandidateMcpConfiguration {
                 (ctx, req) -> {
                     String cid = str(req.arguments(), "candidateId");
                     String aid = str(req.arguments(), "applicationId");
-                    String cJson = candidates.findById(cid).map(this::toJson).orElse("Not found");
-                    String aJson = applications.findById(aid).map(this::toJson).orElse("Not found");
-                    String assJson = toJson(assessments.findByCandidate(cid));
-                    String jid   = applications.findById(aid).map(Application::jobId).orElse(null);
-                    String jJson = jid != null ? jobs.findById(jid).map(this::toJson).orElse("Not found") : "Not found";
+                    String cJson = talentProfileClient.getProfileV2(cid)
+                            .map(profile -> toJson(profileTransformer.transform(profile)))
+                            .orElse("Not found");
+                    String aJson = cxApplicationsClient.getApplication(aid)
+                            .map(app -> toJson(applicationTransformer.transform(app)))
+                            .orElse("Not found");
+                    String assJson = talentProfileClient.getProfileV2(cid)
+                            .map(profile -> toJson(profile.assessments().results()))
+                            .orElse("[]");
+                    String jid = cxApplicationsClient.getApplication(aid).map(AtsApplication::jobId).orElse(null);
+                    String jJson = jid != null ? jobSyncClient.getJob(jid)
+                            .map(job -> toJson(jobTransformer.transform(job)))
+                            .orElse("Not found") : "Not found";
                     return promptResult("Next-step guidance for " + cid,
                         """
                         You are a career coach helping a candidate prepare for the next stage of their interview process.
@@ -870,12 +1115,20 @@ public class CandidateMcpConfiguration {
                 List.of(arg("applicationId", "Application ID for the rejected application", true)),
                 (ctx, req) -> {
                     String aid   = str(req.arguments(), "applicationId");
-                    String aJson = applications.findById(aid).map(this::toJson).orElse("Not found");
-                    String cid   = applications.findById(aid).map(Application::candidateId).orElse(null);
-                    String cJson = cid != null ? candidates.findById(cid).map(this::toJson).orElse("Not found") : "Not found";
-                    String jid   = applications.findById(aid).map(Application::jobId).orElse(null);
-                    String jJson = jid != null ? jobs.findById(jid).map(this::toJson).orElse("Not found") : "Not found";
-                    String assJson = cid != null ? toJson(assessments.findByCandidate(cid)) : "[]";
+                    String aJson = cxApplicationsClient.getApplication(aid)
+                            .map(app -> toJson(applicationTransformer.transform(app)))
+                            .orElse("Not found");
+                    String cid   = cxApplicationsClient.getApplication(aid).map(AtsApplication::candidateId).orElse(null);
+                    String cJson = cid != null ? talentProfileClient.getProfileV2(cid)
+                            .map(profile -> toJson(profileTransformer.transform(profile)))
+                            .orElse("Not found") : "Not found";
+                    String jid   = cxApplicationsClient.getApplication(aid).map(AtsApplication::jobId).orElse(null);
+                    String jJson = jid != null ? jobSyncClient.getJob(jid)
+                            .map(job -> toJson(jobTransformer.transform(job)))
+                            .orElse("Not found") : "Not found";
+                    String assJson = cid != null ? talentProfileClient.getProfileV2(cid)
+                            .map(profile -> toJson(profile.assessments().results()))
+                            .orElse("[]") : "[]";
                     return promptResult("Rejection debrief for application " + aid,
                         """
                         You are a career advisor helping a candidate process a rejection and plan their next move.
@@ -911,11 +1164,17 @@ public class CandidateMcpConfiguration {
                 (ctx, req) -> {
                     String aid     = str(req.arguments(), "applicationId");
                     String context = strOr(req.arguments(), "candidateContext", "None provided");
-                    String aJson   = applications.findById(aid).map(this::toJson).orElse("Not found");
-                    String cid     = applications.findById(aid).map(Application::candidateId).orElse(null);
-                    String cJson   = cid != null ? candidates.findById(cid).map(this::toJson).orElse("Not found") : "Not found";
-                    String jid     = applications.findById(aid).map(Application::jobId).orElse(null);
-                    String jJson   = jid != null ? jobs.findById(jid).map(this::toJson).orElse("Not found") : "Not found";
+                    String aJson   = cxApplicationsClient.getApplication(aid)
+                            .map(app -> toJson(applicationTransformer.transform(app)))
+                            .orElse("Not found");
+                    String cid     = cxApplicationsClient.getApplication(aid).map(AtsApplication::candidateId).orElse(null);
+                    String cJson   = cid != null ? talentProfileClient.getProfileV2(cid)
+                            .map(profile -> toJson(profileTransformer.transform(profile)))
+                            .orElse("Not found") : "Not found";
+                    String jid     = cxApplicationsClient.getApplication(aid).map(AtsApplication::jobId).orElse(null);
+                    String jJson   = jid != null ? jobSyncClient.getJob(jid)
+                            .map(job -> toJson(jobTransformer.transform(job)))
+                            .orElse("Not found") : "Not found";
                     return promptResult("Offer decision support for application " + aid,
                         """
                         You are a trusted career advisor helping a candidate make a high-stakes offer decision.
@@ -952,9 +1211,29 @@ public class CandidateMcpConfiguration {
                 (ctx, req) -> {
                     String cid   = str(req.arguments(), "candidateId");
                     String jid   = str(req.arguments(), "jobId");
-                    String cJson = candidates.findById(cid).map(this::toJson).orElse("Not found");
-                    String jJson = jobs.findById(jid).map(this::toJson).orElse("Not found");
-                    String gapJson = candidates.findById(cid).flatMap(c -> jobs.findById(jid).map(j -> toJson(jobs.matchScore(c, j)))).orElse("{}");
+                    String cJson = talentProfileClient.getProfileV2(cid)
+                            .map(profile -> toJson(profileTransformer.transform(profile)))
+                            .orElse("Not found");
+                    String jJson = jobSyncClient.getJob(jid)
+                            .map(job -> toJson(jobTransformer.transform(job)))
+                            .orElse("Not found");
+                    String gapJson = talentProfileClient.getProfileV2(cid)
+                            .flatMap(profile -> jobSyncClient.getJob(jid).map(job -> {
+                                ProfileAgentContext profileCtx = profileTransformer.transform(profile);
+                                JobAgentContext jobCtx = jobTransformer.transform(job);
+                                Set<String> candidateSkills = profileCtx.skills().stream()
+                                        .map(s -> s.skill().toLowerCase())
+                                        .collect(java.util.stream.Collectors.toSet());
+                                List<String> requiredSkillsLack = jobCtx.requirements().requiredSkills().stream()
+                                        .filter(s -> !candidateSkills.contains(s.toLowerCase())).toList();
+                                int matchScore = calculateMatchScore(profileCtx, jobCtx);
+                                return toJson(Map.of(
+                                    "matchScore", matchScore,
+                                    "requiredSkillsMissing", requiredSkillsLack,
+                                    "requiredAssessments", jobCtx.requiredAssessmentCodes()
+                                ));
+                            }))
+                            .orElse("{}");
                     return promptResult("Profile gap coaching: " + cid + " → " + jid,
                         """
                         You are a technical career coach helping a candidate close the gap between their current profile and a target role.
@@ -982,16 +1261,23 @@ public class CandidateMcpConfiguration {
                 List.of(arg("thresholdDays", "Minimum days in stage to flag as stuck, default 7", false)),
                 (ctx, req) -> {
                     int days = intArg2(req.arguments(), "thresholdDays", 7);
-                    List<Application> stuck = applications.findStuck(days);
-                    List<Map<String, Object>> stuckView = stuck.stream().map(a -> {
+                    List<AtsApplication> allApps = cxApplicationsClient.getApplicationsByCandidate("*"); // NOTE: This is a simplified approach
+                    List<AtsApplication> stuck = allApps.stream()
+                            .filter(app -> {
+                                ApplicationAgentContext agentCtx = applicationTransformer.transform(app);
+                                return agentCtx.daysInCurrentStage() > days;
+                            })
+                            .toList();
+                    List<Map<String, Object>> stuckView = stuck.stream().map(app -> {
+                        ApplicationAgentContext agentCtx = applicationTransformer.transform(app);
                         Map<String, Object> m = new LinkedHashMap<>();
-                        m.put("applicationId",      a.id());
-                        m.put("candidateId",        a.candidateId());
-                        m.put("jobId",              a.jobId());
-                        m.put("currentStatus",      a.status());
-                        m.put("daysInStage",        applications.daysInCurrentStage(a));
-                        m.put("slaThreshold",       STAGE_SLA_DAYS.getOrDefault(a.status(), 0));
-                        m.put("lastChangedAt",      applications.lastStatusChange(a));
+                        m.put("applicationId",      agentCtx.applicationId());
+                        m.put("candidateId",        agentCtx.candidateId());
+                        m.put("jobId",              agentCtx.jobId());
+                        m.put("currentStatus",      agentCtx.status());
+                        m.put("daysInStage",        agentCtx.daysInCurrentStage());
+                        m.put("slaThreshold",       STAGE_SLA_DAYS.getOrDefault(agentCtx.status(), 0));
+                        m.put("slaBreached",        agentCtx.slaBreached());
                         return m;
                     }).toList();
                     return promptResult("Stuck candidates operational report",
@@ -1018,7 +1304,8 @@ public class CandidateMcpConfiguration {
 
     @Bean
     public List<McpStatelessServerFeatures.SyncCompletionSpecification> completions(
-            CandidateService candidates, JobService jobs) {
+            TalentProfileClient talentProfileClient, JobSyncClient jobSyncClient,
+            ProfileTransformer profileTransformer, JobTransformer jobTransformer) {
         return List.of(
 
             // Candidate ID across multiple prompts
@@ -1026,7 +1313,7 @@ public class CandidateMcpConfiguration {
                 new McpSchema.PromptReference("application-status-narrative"),
                 (McpTransportContext ctx, McpSchema.CompleteRequest req) -> {
                     if (!"candidateId".equals(req.argument().name())) return emptyCompletion();
-                    return candidateIdCompletion(candidates, req.argument().value());
+                    return candidateIdCompletion(talentProfileClient, profileTransformer, req.argument().value());
                 }),
 
             // candidateId and jobId for profile-gap-coaching
@@ -1035,8 +1322,8 @@ public class CandidateMcpConfiguration {
                 (McpTransportContext ctx, McpSchema.CompleteRequest req) -> {
                     String partial = req.argument().value().toLowerCase();
                     return switch (req.argument().name()) {
-                        case "candidateId" -> candidateIdCompletion(candidates, partial);
-                        case "jobId"       -> jobIdCompletion(jobs, partial);
+                        case "candidateId" -> candidateIdCompletion(talentProfileClient, profileTransformer, partial);
+                        case "jobId"       -> jobIdCompletion(jobSyncClient, jobTransformer, partial);
                         default            -> emptyCompletion();
                     };
                 }),
@@ -1134,20 +1421,20 @@ public class CandidateMcpConfiguration {
     // COMPLETION HELPERS
     // =========================================================================
 
-    private McpSchema.CompleteResult candidateIdCompletion(CandidateService candidates, String partial) {
-        List<String> s = candidates.findAll().stream()
-                .filter(c -> c.id().toLowerCase().startsWith(partial)
-                        || c.name().toLowerCase().contains(partial))
-                .map(c -> c.id() + " — " + c.name())
-                .limit(5).toList();
-        return new McpSchema.CompleteResult(new McpSchema.CompleteResult.CompleteCompletion(s, s.size(), false));
+    private McpSchema.CompleteResult candidateIdCompletion(TalentProfileClient talentProfileClient,
+                                                           ProfileTransformer profileTransformer, String partial) {
+        // Note: In production, this would need a search/list endpoint on TalentProfileClient
+        // For now, returning empty as we don't have a findAll equivalent
+        return emptyCompletion();
     }
 
-    private McpSchema.CompleteResult jobIdCompletion(JobService jobs, String partial) {
-        List<String> s = jobs.findAll().stream()
-                .filter(j -> j.id().toLowerCase().startsWith(partial)
+    private McpSchema.CompleteResult jobIdCompletion(JobSyncClient jobSyncClient,
+                                                     JobTransformer jobTransformer, String partial) {
+        List<String> s = jobSyncClient.getActiveJobs().stream()
+                .map(jobTransformer::transform)
+                .filter(j -> j.jobId().toLowerCase().startsWith(partial)
                         || j.title().toLowerCase().contains(partial))
-                .map(j -> j.id() + " — " + j.title())
+                .map(j -> j.jobId() + " — " + j.title())
                 .limit(5).toList();
         return new McpSchema.CompleteResult(new McpSchema.CompleteResult.CompleteCompletion(s, s.size(), false));
     }
